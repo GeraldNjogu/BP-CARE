@@ -139,42 +139,67 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
   }, [user, connectedDevice]);
 
   const processNewReading = useCallback(
-    async (reading: VitalReading) => {
-      setLastReading(reading);
-      setHistory((prev) => [reading, ...prev]);
+  async (reading: VitalReading) => {
+    // 1. Instantly update the local UI states for an immediate visual feedback loop
+    setLastReading(reading);
+    setHistory((prev) => [reading, ...prev]);
 
-      if (!user) return;
+    // 2. Auth Session Guard
+    if (!user) {
+      console.warn("⚠️ Database transaction aborted: No authenticated user found in BLEContext.");
+      return;
+    }
 
-      try {
-        const saved = await saveVitalReading(user.id, reading);
+    let savedReadingRow = null;
 
-        const prediction = computePrediction(reading);
-        await createPrediction(user.id, saved.id, prediction);
+    // STEP 1: Secure the vital reading inside the database primary ledger
+    try {
+      console.log("Saving manual entry payload to Supabase...", reading);
+      savedReadingRow = await saveVitalReading(user.id, reading);
+      console.log("✅ Core vital reading successfully committed to Supabase:", savedReadingRow);
+    } catch (err) {
+      console.error("❌ CRITICAL DB ERROR: Primary vital reading failed to save:", err);
+      // Exit here because downstream metrics depend directly on a successful database row write
+      return; 
+    }
 
-        const xaiInsights = computeXAIInsights(reading);
-        for (const insight of xaiInsights) {
-          await createXAIInsight(user.id, saved.id, insight);
-        }
+    // STEP 2: Process background calculations (ML, XAI, Notifications) safely in isolation
+    try {
+      console.log("Processing background AI models and alerts...");
+      
+      // Calculate and send ML prediction
+      const prediction = computePrediction(reading);
+      await createPrediction(user.id, savedReadingRow.id, prediction);
 
-        if (reading.systolic >= 180 || reading.diastolic >= 120) {
-          await createNotification(user.id, {
-            title: "Hypertensive Crisis Detected",
-            body: `Your BP reading of ${reading.systolic}/${reading.diastolic} mmHg is in the crisis range. Seek medical attention immediately.`,
-            type: "alert",
-          });
-        } else if (reading.systolic >= 160 || reading.diastolic >= 100) {
-          await createNotification(user.id, {
-            title: "High Blood Pressure Alert",
-            body: `Your systolic reading of ${reading.systolic} mmHg is elevated. Rest and re-measure in 15 minutes.`,
-            type: "alert",
-          });
-        }
-      } catch (err) {
-        console.error("Failed to process reading:", err);
+      // Map and send XAI Explanations
+      const xaiInsights = computeXAIInsights(reading);
+      for (const insight of xaiInsights) {
+        await createXAIInsight(user.id, savedReadingRow.id, insight);
       }
-    },
-    [user]
-  );
+
+      // Dispatch real-time crisis notifications
+      if (reading.systolic >= 180 || reading.diastolic >= 120) {
+        await createNotification(user.id, {
+          title: "Hypertensive Crisis Detected",
+          body: `Your BP reading of ${reading.systolic}/${reading.diastolic} mmHg is in the crisis range. Seek medical attention immediately.`,
+          type: "alert",
+        });
+      } else if (reading.systolic >= 160 || reading.diastolic >= 100) {
+        await createNotification(user.id, {
+          title: "High Blood Pressure Alert",
+          body: `Your systolic reading of ${reading.systolic} mmHg is elevated. Rest and re-measure in 15 minutes.`,
+          type: "alert",
+        });
+      }
+      
+      console.log("✅ Background analytics and notification queries complete.");
+    } catch (auxErr) {
+      // If an ML module or notification dispatch breaks, log it as a warning, but do NOT disrupt the user save!
+      console.warn("⚠️ Secondary AI/Notification features failed, but core reading remains safe:", auxErr);
+    }
+  },
+  [user]
+);
 
   const startMeasurement = useCallback(() => {
     setIsMeasuring(true);

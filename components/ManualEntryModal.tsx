@@ -24,17 +24,23 @@ export default function ManualEntryModal({
   const [diastolic, setDiastolic] = useState("");
   const [heartRate, setHeartRate] = useState("");
 
-  const handleSave = () => {
-    const sys = parseInt(systolic, 10);
-    const dia = parseInt(diastolic, 10);
-    const hr = parseInt(heartRate, 10);
-    if (!sys || !dia || !hr) return;
-    addManualReading(sys, dia, hr);
-    setSystolic("");
-    setDiastolic("");
-    setHeartRate("");
-    onClose();
-  };
+ const handleSave = () => {
+  const sys = parseInt(systolic, 10);
+  const dia = parseInt(diastolic, 10);
+  const hr = parseInt(heartRate, 10);
+  
+  // FIX: Explicitly check for NaN instead of generic falsiness, so users can test with 0 if needed without code locking up
+  if (isNaN(sys) || isNaN(dia) || isNaN(hr)) {
+    console.warn("Manual entry rejected: One or more fields are invalid numbers.");
+    return;
+  }
+  
+  addManualReading(sys, dia, hr);
+  setSystolic("");
+  setDiastolic("");
+  setHeartRate("");
+  onClose();
+};
 
   return (
     <Modal visible={visible} transparent animationType="fade">

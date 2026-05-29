@@ -1,6 +1,7 @@
 import { View, Text, TouchableOpacity, ScrollView } from "react-native";
 import { useTheme } from "@/context/ThemeContext";
 import { useNotifications } from "@/context/NotificationContext";
+import { useState } from "react";
 import {
   Bell,
   Pill,
@@ -26,10 +27,22 @@ const typeConfig = {
 export default function NotificationsScreen() {
   const { colors } = useTheme();
   const { items, markRead, markAllRead, unreadCount } = useNotifications();
+  
+  // Track the active filter tab
+  const [activeFilter, setActiveFilter] = useState<"All" | "Alerts" | "Medication" | "Insights">("All");
 
   const sortedItems = [...items].sort(
     (a, b) => b.timestamp.getTime() - a.timestamp.getTime()
   );
+
+  // Filter items matching the backend types
+  const filteredItems = sortedItems.filter((item) => {
+    if (activeFilter === "All") return true;
+    if (activeFilter === "Alerts") return item.type === "alert";
+    if (activeFilter === "Medication") return item.type === "medication";
+    if (activeFilter === "Insights") return item.type === "recommendation";
+    return true;
+  });
 
   const timeAgo = (date: Date) => {
     const now = new Date();
@@ -99,44 +112,39 @@ export default function NotificationsScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* Filter Tabs */}
-        <View
+       {/* Update the Filter Tabs Block */}
+<View style={{ flexDirection: "row", paddingHorizontal: 20, marginBottom: 16, gap: 8 }}>
+  {(["All", "Alerts", "Medication", "Insights"] as const).map((filter) => {
+    const isActive = activeFilter === filter;
+    return (
+      <TouchableOpacity
+        key={filter}
+        onPress={() => setActiveFilter(filter)} // <--- Changes active tab
+        style={{
+          paddingHorizontal: 14,
+          paddingVertical: 6,
+          borderRadius: 10,
+          backgroundColor: isActive ? colors.tint : colors.card,
+          borderWidth: 1,
+          borderColor: isActive ? colors.tint : colors.border,
+        }}
+      >
+        <Text
           style={{
-            flexDirection: "row",
-            paddingHorizontal: 20,
-            marginBottom: 16,
-            gap: 8,
+            fontSize: 12,
+            fontWeight: "700",
+            color: isActive ? "#fff" : colors.textSecondary,
           }}
         >
-          {(["All", "Alerts", "Medication", "Insights"] as const).map(
-            (filter) => (
-              <TouchableOpacity
-                key={filter}
-                style={{
-                  paddingHorizontal: 14,
-                  paddingVertical: 6,
-                  borderRadius: 10,
-                  backgroundColor: filter === "All" ? colors.tint : colors.card,
-                  borderWidth: 1,
-                  borderColor: filter === "All" ? colors.tint : colors.border,
-                }}
-              >
-                <Text
-                  style={{
-                    fontSize: 12,
-                    fontWeight: "700",
-                    color: filter === "All" ? "#fff" : colors.textSecondary,
-                  }}
-                >
-                  {filter}
-                </Text>
-              </TouchableOpacity>
-            )
-          )}
-        </View>
+          {filter}
+        </Text>
+      </TouchableOpacity>
+    );
+  })}
+</View>
 
-        {/* Notification List */}
-        {sortedItems.map((notification, idx) => {
+{/* Update the Notification List Block */}
+{filteredItems.map((notification, idx) => {
           const config = typeConfig[notification.type];
           const Icon = config.icon;
           return (

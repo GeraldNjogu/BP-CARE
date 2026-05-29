@@ -1,8 +1,10 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { View, Text, TouchableOpacity, ScrollView, Switch } from "react-native";
 import { useTheme } from "@/context/ThemeContext";
 import { useAuth } from "@/context/AuthContext";
 import { useBLE } from "@/context/BLEContext";
+import { getSettings, updateSettings } from "@/services/settings";
+import MedicationTimeModal from "@/components/MedicationTimeModal";
 import {
   Moon,
   Bell,
@@ -16,6 +18,7 @@ import {
   Trash2,
   HelpCircle,
   Info,
+  Clock,
 } from "lucide-react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import Animated, { FadeInUp } from "react-native-reanimated";
@@ -23,13 +26,77 @@ import Chatbot from "@/components/Chatbot";
 
 export default function SettingsScreen() {
   const { colors, isDark, toggleTheme } = useTheme();
-  const { logout } = useAuth();
+  const { logout, user } = useAuth();
   const { connectedDevice } = useBLE();
+  
+  // App states matching your original structure + new calendar sync states
   const [notifications, setNotifications] = useState(true);
   const [medicationReminders, setMedicationReminders] = useState(true);
+  const [bpAlerts, setBpAlerts] = useState(true);
   const [dataSync, setDataSync] = useState(true);
+  const [autoReconnect, setAutoReconnect] = useState(true);
+  
+  // Real-time alarm schedules tracking states
+  const [reminderTimes, setReminderTimes] = useState<string[]>([]);
+  const [modalVisible, setModalVisible] = useState(false);
 
-  const settingsSections = [
+  // Sync state data safely directly out of Supabase on layout initialization
+  useEffect(() => {
+    if (user) {
+      getSettings(user.id)
+        .then((data) => {
+          if (data) {
+            setNotifications(data.notificationsEnabled);
+            setMedicationReminders(data.medicationReminders);
+            setBpAlerts(data.bpAlerts);
+            setReminderTimes(data.medicationReminderTimes || []);
+          }
+        })
+        .catch((err) => console.error("Error fetching settings profile:", err));
+    }
+  }, [user]);
+
+  // Persistent switch toggle handlers matching your atomic state layout
+  const handleToggleNotifications = async (val: boolean) => {
+    setNotifications(val);
+    if (user) await updateSettings(user.id, { notificationsEnabled: val });
+  };
+
+  const handleToggleReminders = async (val: boolean) => {
+    setMedicationReminders(val);
+    if (user) await updateSettings(user.id, { medicationReminders: val });
+  };
+
+  const handleToggleBpAlerts = async (val: boolean) => {
+    setBpAlerts(val);
+    if (user) await updateSettings(user.id, { bpAlerts: val });
+  };
+
+  const handleSaveTimes = async (newTimes: string[]) => {
+    setReminderTimes(newTimes);
+    if (user) await updateSettings(user.id, { medicationReminderTimes: newTimes });
+  };
+
+ // 1. Define explicit TypeScript shapes for the settings configuration matrix
+  type SettingsItem = {
+    icon: any;
+    label: string;
+    value: string;
+    toggle?: boolean;
+    state?: boolean;
+    onToggle?: (val: boolean) => void | Promise<void>;
+    chevron?: boolean;
+    action?: () => void;
+    danger?: boolean;
+  };
+
+  type SettingsSection = {
+    title: string;
+    items: SettingsItem[];
+  };
+
+  // 2. Apply the SettingsSection[] type to your array
+  const settingsSections: SettingsSection[] = [
     {
       title: "Appearance",
       items: [
@@ -52,7 +119,7 @@ export default function SettingsScreen() {
           value: notifications ? "Enabled" : "Disabled",
           toggle: true,
           state: notifications,
-          onToggle: () => setNotifications(!notifications),
+          onToggle: handleToggleNotifications,
         },
         {
           icon: Bell,
@@ -60,7 +127,22 @@ export default function SettingsScreen() {
           value: medicationReminders ? "Enabled" : "Disabled",
           toggle: true,
           state: medicationReminders,
-          onToggle: () => setMedicationReminders(!medicationReminders),
+          onToggle: handleToggleReminders,
+        },
+        {
+          icon: Clock,
+          label: "Setup Alarm Schedules",
+          value: reminderTimes.length > 0 ? `${reminderTimes.length} alarms saved` : "None configured",
+          chevron: true,
+          action: () => setModalVisible(true), // <-- 'action' is now perfectly safe
+        },
+        {
+          icon: Bell,
+          label: "BP Level Alerts",
+          value: bpAlerts ? "Enabled" : "Disabled",
+          toggle: true,
+          state: bpAlerts,
+          onToggle: handleToggleBpAlerts,
         },
       ],
     },
@@ -76,10 +158,10 @@ export default function SettingsScreen() {
         {
           icon: Smartphone,
           label: "Auto Reconnect",
-          value: "Enabled",
+          value: autoReconnect ? "Enabled" : "Disabled",
           toggle: true,
-          state: true,
-          onToggle: () => {},
+          state: autoReconnect,
+          onToggle: () => setAutoReconnect(!autoReconnect),
         },
       ],
     },
@@ -97,13 +179,13 @@ export default function SettingsScreen() {
         {
           icon: Shield,
           label: "Privacy Settings",
-          value: "",
+          value: "Manage encryption & RLS data options",
           chevron: true,
         },
         {
           icon: Trash2,
           label: "Clear Health Data",
-          value: "",
+          value: "Wipe device cache securely",
           chevron: true,
           danger: true,
         },
@@ -140,21 +222,9 @@ export default function SettingsScreen() {
         contentContainerStyle={{ paddingBottom: 120 }}
         showsVerticalScrollIndicator={false}
       >
-        {/* Header */}
-        <View
-          style={{
-            paddingTop: 60,
-            paddingHorizontal: 20,
-            paddingBottom: 16,
-          }}
-        >
-          <Text
-            style={{
-              fontSize: 28,
-              fontWeight: "800",
-              color: colors.text,
-            }}
-          >
+        {/* Header Section */}
+        <View style={{ paddingTop: 60, paddingHorizontal: 20, paddingBottom: 16 }}>
+          <Text style={{ fontSize: 28, fontWeight: "800", color: colors.text }}>
             Settings
           </Text>
           <Text style={{ fontSize: 14, color: colors.textMuted, marginTop: 4 }}>
@@ -162,6 +232,7 @@ export default function SettingsScreen() {
           </Text>
         </View>
 
+        {/* Dynamic Sections Generator Loop */}
         {settingsSections.map((section, sIdx) => (
           <Animated.View
             key={section.title}
@@ -190,79 +261,84 @@ export default function SettingsScreen() {
                 overflow: "hidden",
               }}
             >
-              {section.items.map((item, iIdx) => (
-                <View
-                  key={item.label}
-                  style={{
-                    flexDirection: "row",
-                    alignItems: "center",
-                    paddingVertical: 12,
-                    paddingHorizontal: 16,
-                    borderBottomWidth:
-                      iIdx < section.items.length - 1 ? 1 : 0,
-                    borderBottomColor: colors.border,
-                  }}
-                >
-                  <View
+              {section.items.map((item, iIdx) => {
+                const ItemWrapper = item.action ? TouchableOpacity : View;
+                return (
+                  <ItemWrapper
+                    key={item.label}
+                    {...(item.action ? { onPress: item.action, activeOpacity: 0.7 } : {})}
                     style={{
-                      width: 36,
-                      height: 36,
-                      borderRadius: 10,
-                      backgroundColor: item.danger
-                        ? `${colors.danger}12`
-                        : colors.inputBackground,
-                      justifyContent: "center",
+                      flexDirection: "row",
                       alignItems: "center",
-                      marginRight: 12,
+                      paddingVertical: 12,
+                      paddingHorizontal: 16,
+                      borderBottomWidth: iIdx < section.items.length - 1 ? 1 : 0,
+                      borderBottomColor: colors.border,
                     }}
                   >
-                    <item.icon
-                      size={18}
-                      color={item.danger ? colors.danger : colors.tint}
-                    />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text
+                    <View
                       style={{
-                        fontSize: 15,
-                        fontWeight: "600",
-                        color: item.danger ? colors.danger : colors.text,
+                        width: 36,
+                        height: 36,
+                        borderRadius: 10,
+                        backgroundColor: item.danger
+                          ? `${colors.danger}12`
+                          : colors.inputBackground,
+                        justifyContent: "center",
+                        alignItems: "center",
+                        marginRight: 12,
                       }}
                     >
-                      {item.label}
-                    </Text>
-                    {item.value ? (
+                      <item.icon
+                        size={18}
+                        color={item.danger ? colors.danger : colors.tint}
+                      />
+                    </View>
+                    <View style={{ flex: 1 }}>
                       <Text
                         style={{
-                          fontSize: 12,
-                          color: colors.textMuted,
-                          marginTop: 1,
+                          fontSize: 15,
+                          fontWeight: "600",
+                          color: item.danger ? colors.danger : colors.text,
                         }}
                       >
-                        {item.value}
+                        {item.label}
                       </Text>
+                      {item.value ? (
+                        <Text
+                          style={{
+                            fontSize: 12,
+                            color: colors.textMuted,
+                            marginTop: 1,
+                          }}
+                        >
+                          {item.value}
+                        </Text>
+                      ) : null}
+                    </View>
+                    {item.toggle ? (
+                      <Switch
+                        value={item.state}
+                        onValueChange={item.onToggle}
+                        trackColor={{
+                          false: colors.border,
+                          true: `${colors.tint}80`,
+                        }}
+                        thumbColor={
+                          item.state ? colors.tint : colors.textMuted
+                        }
+                      />
+                    ) : item.chevron ? (
+                      <ChevronRight size={18} color={colors.textMuted} />
                     ) : null}
-                  </View>
-                  {item.toggle ? (
-                    <Switch
-                      value={item.state}
-                      onValueChange={item.onToggle}
-                      trackColor={{
-                        false: colors.border,
-                        true: `${colors.tint}80`,
-                      }}
-                      thumbColor={item.state ? colors.tint : colors.textMuted}
-                    />
-                  ) : item.chevron ? (
-                    <ChevronRight size={18} color={colors.textMuted} />
-                  ) : null}
-                </View>
-              ))}
+                  </ItemWrapper>
+                );
+              })}
             </View>
           </Animated.View>
         ))}
 
-        {/* Logout */}
+        {/* Logout Section */}
         <Animated.View
           entering={FadeInUp.delay(500).duration(600)}
           style={{ paddingHorizontal: 20, marginBottom: 30 }}
@@ -295,6 +371,14 @@ export default function SettingsScreen() {
           </TouchableOpacity>
         </Animated.View>
       </ScrollView>
+      
+      {/* Medication Time Selector Modal overlay layout view */}
+      <MedicationTimeModal
+        visible={modalVisible}
+        onClose={() => setModalVisible(false)}
+        savedTimes={reminderTimes}
+        onSave={handleSaveTimes}
+      />
       <Chatbot />
     </View>
   );

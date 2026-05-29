@@ -1,6 +1,7 @@
 import createContextHook from "@nkzw/create-context-hook";
 import { useState, useCallback, useEffect } from "react";
 import { useAuth } from "@/context/AuthContext";
+import {supabase} from "@/lib/supabase";
 import {
   getNotifications,
   markNotificationRead,
@@ -44,13 +45,47 @@ export const [NotificationProvider, useNotifications] = createContextHook((): No
   }, [user]);
 
   useEffect(() => {
-    if (isAuthenticated && user) {
-      loadNotifications();
-    } else {
-      setItems([]);
-      setIsLoading(false);
-    }
-  }, [isAuthenticated, user, loadNotifications]);
+  if (!isAuthenticated || !user) {
+    setItems([]);
+    setIsLoading(false);
+    return;
+  }
+
+  // 1. Initial Load of notifications
+  loadNotifications();
+
+  // 2. Setup Real-time Subscription channel
+  const channel = supabase
+    .channel(`public:notifications:user_id=eq.${user.id}`)
+    .on(
+      "postgres_changes",
+      {
+        event: "INSERT",
+        schema: "public",
+        table: "notifications",
+        filter: `user_id=eq.${user.id}`,
+      },
+      (payload) => {
+        const newNotif: NotificationItem = {
+          id: payload.new.id,
+          title: payload.new.title,
+          body: payload.new.body,
+          type: payload.new.type,
+          read: payload.new.read,
+          timestamp: new Date(payload.new.timestamp),
+        };
+
+        // Prepend the new notification to the top of the state array
+        setItems((prev) => [newNotif, ...prev]);
+      }
+    )
+    .subscribe();
+
+  // 3. Clean up the subscription channel when component unmounts or user changes
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}, [isAuthenticated, user, loadNotifications]);
 
   const markRead = useCallback(
     async (id: string) => {

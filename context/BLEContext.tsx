@@ -202,6 +202,20 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
 );
 
   const startMeasurement = useCallback(() => {
+    if (!connectedDevice) {
+      console.warn("Attempted to start measurement with no connected device");
+      if (user) {
+        createNotification(user.id, {
+          title: "No Device Connected",
+          body: "Please connect a BLE device before starting a measurement.",
+          type: "warning",
+        }).catch(() => {});
+      }
+      return;
+    }
+
+    if (isMeasuring) return; // already measuring
+
     setIsMeasuring(true);
     let progress = 0;
     measureInterval.current = setInterval(() => {
@@ -219,7 +233,7 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
         setIsMeasuring(false);
       }
     }, 1000);
-  }, [processNewReading]);
+  }, [connectedDevice, isMeasuring, processNewReading, user]);
 
   const stopMeasurement = useCallback(() => {
     if (measureInterval.current) clearInterval(measureInterval.current);

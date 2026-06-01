@@ -10,6 +10,7 @@ import {
 import { useTheme } from "@/context/ThemeContext";
 import { useAuth } from "@/context/AuthContext";
 import { useBLE } from "@/context/BLEContext";
+import { useRouter } from "expo-router";
 import {
   Heart,
   Activity,
@@ -54,6 +55,7 @@ function getBPCategory(sys: number, dia: number) {
 }
 
 export default function DashboardScreen() {
+  const router = useRouter();
   const { colors } = useTheme();
   const { user } = useAuth();
   const {
@@ -471,7 +473,13 @@ export default function DashboardScreen() {
                   }}
                 >
                   <TouchableOpacity
-                    onPress={startMeasurement}
+                    onPress={() => {
+                      if (connectedDevice) {
+                        startMeasurement();
+                      } else {
+                        router.push({ pathname: "/(tabs)/devices" } as any);
+                      }
+                    }}
                     activeOpacity={0.85}
                     style={{ flex: 1 }}
                   >

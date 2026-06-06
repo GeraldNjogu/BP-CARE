@@ -177,8 +177,8 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
             errorMessage.includes("off") ||
             errorMessage.includes("enable") ||
             errorMessage.includes("permission") ||
-            error.code === "BluetoothNotSupported" ||
-            error.code === "BluetoothNotEnabled"
+            (error as any).code === "BluetoothNotSupported" ||
+            (error as any).code === "BluetoothNotEnabled"
           ) {
             setIsScanning(false);
             bleManager.stopDeviceScan();
@@ -398,6 +398,13 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
     const hex = buffer.toString("hex");
     const timestamp = new Date();
 
+    console.log("tryParseNUSReading payload:", {
+      hex,
+      ascii,
+      length: buffer.length,
+      timestamp: timestamp.toISOString(),
+    });
+
     const validBp = (sys: number, dia: number, hr: number) => {
       return (
         sys >= 70 && sys <= 250 &&
@@ -407,11 +414,18 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
       );
     };
 
-    const buildReading = (sys: number, dia: number, hr: number) => {
+    const buildReading = (sys: number, dia: number, hr: number): VitalReading | null => {
       if (!validBp(sys, dia, hr)) {
         return null;
       }
-      return { systolic: sys, diastolic: dia, heartRate: hr, timestamp, source: "ble" };
+      const reading: VitalReading = {
+        systolic: sys,
+        diastolic: dia,
+        heartRate: hr,
+        timestamp,
+        source: "ble",
+      };
+      return reading;
     };
 
     if (ascii) {
@@ -581,6 +595,14 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
       }
 
       if (!device) {
+        try {
+          device = await bleManager.connectToDevice(connectedDevice.id, { autoConnect: true });
+        } catch (connectErr) {
+          console.warn("Failed to reconnect to BLE device by id:", connectedDevice.id, connectErr);
+        }
+      }
+
+      if (!device) {
         throw new Error("Device not found in BLE manager");
       }
 
@@ -680,10 +702,74 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
             console.log(`NUS measurement attempt ${measurementAttempt}/${maxAttempts}`);
             notifications.length = 0;
 
+            try {
+              const services = await device.services();
+              let nusMonitorCharacteristic = null;
+              let cccdDescriptor = null;
+
+              for (const service of services) {
+                if (service.uuid.toLowerCase() === NUS_SERVICE_UUID.toLowerCase()) {
+                  const chars = await service.characteristics();
+                  for (const char of chars) {
+                    if (char.uuid.toLowerCase() === NUS_TX_UUID.toLowerCase()) {
+                      nusMonitorCharacteristic = char;
+                      console.log("Found NUS TX characteristic", {
+                        uuid: char.uuid,
+                        isNotifiable: char.isNotifiable,
+                        isIndicatable: char.isIndicatable,
+                      });
+
+                      try {
+                        const descriptors = await char.descriptors();
+                        for (const descriptor of descriptors) {
+                          if (descriptor.uuid.toLowerCase() === "2902") {
+                            cccdDescriptor = descriptor;
+                            console.log("Found CCCD descriptor for NUS TX", { uuid: descriptor.uuid });
+                            break;
+                          }
+                        }
+                      } catch (err) {
+                        console.warn("Failed to fetch CCCD descriptor:", err);
+                      }
+
+                      break;
+                    }
+                  }
+                  break;
+                }
+              }
+
+              if (!nusMonitorCharacteristic) {
+                console.warn("NUS TX characteristic not found for pre-check");
+              }
+
+              if (cccdDescriptor) {
+                try {
+                  console.log("Attempting to enable notifications via CCCD write...");
+                  await device.writeDescriptorForService(
+                    NUS_SERVICE_UUID,
+                    NUS_TX_UUID,
+                    "2902",
+                    Buffer.from([0x01, 0x00]).toString("base64")
+                  );
+                  console.log("CCCD descriptor write successful");
+                  await new Promise((resolve) => setTimeout(resolve, 200));
+                } catch (err) {
+                  console.warn("Failed to write CCCD descriptor:", err);
+                }
+              } else {
+                console.log("No CCCD descriptor found, relying on monitorCharacteristicForService");
+              }
+            } catch (err) {
+              console.warn("Failed to pre-check NUS characteristics:", err);
+            }
+
+            let callbackInvoked = false;
             const subscription = device.monitorCharacteristicForService(
               NUS_SERVICE_UUID,
               NUS_TX_UUID,
               (error, characteristic) => {
+                callbackInvoked = true;
                 if (error) {
                   const reason =
                     (error as any)?.reason ||
@@ -697,20 +783,26 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
                 }
 
                 if (!characteristic?.value) {
+                  console.log("NUS notification callback fired but no value");
                   return;
                 }
 
                 const payload = Buffer.from(characteristic.value, "base64");
-                console.log(
-                  "NUS notification:",
-                  payload.toString("hex"),
-                  payload.toString("ascii")
-                );
+                console.log("NUS notification received", {
+                  hex: payload.toString("hex"),
+                  ascii: payload.toString("ascii"),
+                  length: payload.length,
+                  totalNotifications: notifications.length + 1,
+                });
                 notifications.push(payload);
               }
             );
 
-            console.log("NUS subscription established, sending commands...");
+            console.log("NUS subscription established, sending commands...", {
+              deviceId: device.id,
+              attempt: measurementAttempt,
+              notificationsSoFar: notifications.length,
+            });
 
             const candidateCommands = [
               Buffer.from([0x01]),
@@ -752,6 +844,13 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
 
             console.log("Commands sent, waiting 10 seconds for device response...");
             await new Promise((resolve) => setTimeout(resolve, 10000));
+            const subscriptionErrorMessage = subscriptionError ? (subscriptionError as Error).message : null;
+            console.log("NUS read cycle complete", {
+              attempt: measurementAttempt,
+              notificationCount: notifications.length,
+              subscriptionError: subscriptionErrorMessage,
+              callbackInvoked,
+            });
             subscription?.remove();
 
             if (subscriptionError) {
@@ -760,7 +859,7 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
 
             if (notifications.length === 0) {
               console.warn(
-                `Attempt ${measurementAttempt}: No NUS notifications received. Error: ${subscriptionError?.message || "none"}`
+                `Attempt ${measurementAttempt}: No NUS notifications received. Callback invoked: ${callbackInvoked}. Error: ${subscriptionError ? (subscriptionError as Error).message : "none"}`
               );
               if (measurementAttempt < maxAttempts) {
                 console.log("Retrying after brief delay...");
@@ -770,16 +869,27 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
               console.log(`Attempt ${measurementAttempt}: Received ${notifications.length} notification(s)`);
             }
 
-            for (const payload of notifications) {
+            for (const [index, payload] of notifications.entries()) {
               const parsed = tryParseNUSReading(payload);
               if (parsed) {
                 measurementMethod = parsed.method;
                 systolic = parsed.reading.systolic;
                 diastolic = parsed.reading.diastolic;
                 heartRate = parsed.reading.heartRate;
-                console.log("Parsed measurement:", { systolic, diastolic, heartRate, method: measurementMethod });
+                console.log("Parsed measurement from notification", {
+                  index,
+                  systolic,
+                  diastolic,
+                  heartRate,
+                  method: measurementMethod,
+                });
                 break;
               }
+              console.log("NUS payload ignored or not parsed", {
+                index,
+                hex: payload.toString("hex"),
+                ascii: payload.toString("ascii"),
+              });
             }
 
             if (!hasCompleteMeasurement() && notifications.length > 1) {
@@ -798,22 +908,9 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
           if (!hasCompleteMeasurement() && notifications.length === 0) {
             console.warn("Device not responding to NUS commands. Manual entry may be required.");
           }
-
-          if (measurementMethod === "fallback") {
-            Alert.alert(
-              "Measurement May Be Inaccurate",
-              "This watch is using a nonstandard BLE payload format. The reading may not be fully accurate.",
-              [{ text: "OK" }]
-            );
-          }
         }
       } catch (readErr) {
         console.warn("Could not read BLE characteristics:", readErr);
-        Alert.alert(
-          "Reading in Progress",
-          "Measurement is being taken from your device...",
-          [{ text: "OK" }]
-        );
       }
 
       if (systolic === null || diastolic === null || heartRate === null) {

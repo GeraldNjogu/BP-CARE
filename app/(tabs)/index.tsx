@@ -474,14 +474,18 @@ export default function DashboardScreen() {
                 >
                   <TouchableOpacity
                     onPress={() => {
+                      if (isMeasuring) {
+                        return;
+                      }
                       if (connectedDevice) {
                         startMeasurement();
                       } else {
                         router.push({ pathname: "/(tabs)/devices" } as any);
                       }
                     }}
-                    activeOpacity={0.85}
-                    style={{ flex: 1 }}
+                    activeOpacity={isMeasuring ? 1 : 0.85}
+                    disabled={isMeasuring}
+                    style={{ flex: 1, opacity: isMeasuring ? 0.65 : 1 }}
                   >
                     <LinearGradient
                       colors={[colors.gradientStart, colors.gradientEnd]}

@@ -14,7 +14,7 @@ import {
 import { createNotification } from "@/services/notifications";
 import { computePrediction, computeXAIInsights, createPrediction, createXAIInsight } from "@/services/predictions";
 import { BleManager } from "react-native-ble-plx";
-import { PermissionsAndroid, Platform } from "react-native";
+import { PermissionsAndroid, Platform, Alert } from "react-native";
 import { Buffer } from "buffer";
 
 export type BLEDevice = {
@@ -52,107 +52,111 @@ type BLEState = {
 
 const bleManager = new BleManager();
 
-// Request BLE permissions for Android
-const requestBLEPermissions = async () => {
-  if (Platform.OS === "android") {
-    try {
-      const result = await PermissionsAndroid.requestMultiple([
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
-        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
-        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-      ]);
-      return (
-        result["android.permission.BLUETOOTH_SCAN"] === "granted" &&
-        result["android.permission.BLUETOOTH_CONNECT"] === "granted"
-      );
-    } catch (err) {
-      console.error("Failed to request BLE permissions:", err);
-      return false;
-    }
-  }
-  return true;
-};
+const WATCH_SERVICE_UUIDS = [
+  "180f",
+  "180a",
+  "6e400001-b5a3-f393-e0a9-e50e24dcca9f",
+  "0000ff00-0000-1000-8000-00805f9b34fb",
+  "0000ff10-0000-1000-8000-00805f9b34fb",
+  "0000ff12-0000-1000-8000-00805f9b34fb",
+];
 
-// Check if Bluetooth is powered on
-const checkBluetoothEnabled = async (userId: string) => {
+const NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9f";
+const NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9f";
+const NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9f";
+
+const base64ToHex = (value: string) => {
   try {
-    const state = await bleManager.state();
-    if (state !== "PoweredOn") {
-      await createNotification(userId, {
-        title: "Bluetooth Disabled",
-        body: "Please enable Bluetooth in your device settings to scan for devices.",
-        type: "device",
-      }).catch(() => {});
-      return false;
-    }
-    return true;
+    return Buffer.from(value, "base64").toString("hex");
   } catch (err) {
-    console.error("Failed to check Bluetooth state:", err);
-    return true; // Assume it's on if we can't check
+    return "";
   }
 };
 
-export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
-  const { user, isAuthenticated } = useAuth();
+const isRelevantDevice = (device: {
+  name?: string | null;
+  localName?: string | null;
+  serviceUUIDs?: string[] | null;
+}) => {
+  const name = (device.name || device.localName || "").toLowerCase();
+  const serviceUUIDs = (device.serviceUUIDs || []).map((uuid) => uuid.toLowerCase());
+
+  const matchesName = /watch|blood|bp|pressure|monitor|device|sphygmomanometer/.test(name);
+  const matchesService = serviceUUIDs.some((uuid) => WATCH_SERVICE_UUIDS.includes(uuid));
+
+  return matchesName || matchesService;
+};
+
+const isValidBloodPressure = (systolic: number, diastolic: number) => {
+  return (
+    systolic >= 70 &&
+    systolic <= 250 &&
+    diastolic >= 40 &&
+    diastolic <= 160 &&
+    diastolic < systolic
+  );
+};
+
+const isValidHeartRate = (heartRate: number) => {
+  return heartRate >= 30 && heartRate <= 220;
+};
+
+type NUSParseResult = {
+  reading: VitalReading;
+  method: "ascii" | "exact" | "fallback";
+};
+
+export const [BLEProvider, useBLE] = createContextHook(() => {
+  const { user } = useAuth();
+
   const [isScanning, setIsScanning] = useState(false);
   const [isMeasuring, setIsMeasuring] = useState(false);
   const [connectedDevice, setConnectedDevice] = useState<BLEDevice | null>(null);
   const [discoveredDevices, setDiscoveredDevices] = useState<BLEDevice[]>([]);
   const [lastReading, setLastReading] = useState<VitalReading | null>(null);
   const [history, setHistory] = useState<VitalReading[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isLoading, setIsLoading] = useState(false);
+  const disconnectSubscriptionRef = useRef<any>(null);
 
-  const refreshHistory = useCallback(async () => {
-    if (!user) return;
+  const checkBluetoothEnabled = async (_userId?: string) => {
     try {
-      setIsLoading(true);
-      const readings = await getVitalReadings(user.id, 50);
-      setHistory(readings);
-      if (readings.length > 0) {
-        setLastReading(readings[0]);
-      }
-    } catch (err) {
-      console.error("Failed to load readings:", err);
-    } finally {
-      setIsLoading(false);
-    }
-  }, [user]);
+      if (Platform.OS === "android") {
+        const permissions = [
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+        ];
 
-  useEffect(() => {
-    if (isAuthenticated && user) {
-      refreshHistory();
-      getConnectedDevices(user.id)
-        .then((devices) => {
-          if (devices.length > 0) setConnectedDevice(devices[0]);
-        })
-        .catch(() => {});
-    } else {
-      setHistory([]);
-      setLastReading(null);
-      setConnectedDevice(null);
-      setIsLoading(false);
+        // Android 12+ requires BLUETOOTH_SCAN and BLUETOOTH_CONNECT
+        if (Platform.Version >= 31) {
+          permissions.push(
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+            PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT
+          );
+        }
+
+        const results = await PermissionsAndroid.requestMultiple(permissions);
+        
+        // Check if all required permissions are granted
+        return Object.values(results).every(
+          (result) => result === PermissionsAndroid.RESULTS.GRANTED
+        );
+      }
+      return true;
+    } catch (err) {
+      console.error("Permission request error:", err);
+      return true;
     }
-  }, [isAuthenticated, user, refreshHistory]);
+  };
 
   const startScan = useCallback(async () => {
     try {
-      const hasPermissions = await requestBLEPermissions();
-      if (!hasPermissions) {
-        console.error("BLE permissions not granted");
-        if (user) {
-          await createNotification(user.id, {
-            title: "Permission Denied",
-            body: "BLE permissions are required to scan for devices.",
-            type: "device",
-          }).catch(() => {});
-        }
-        return;
-      }
-
-      // Check if Bluetooth is enabled
       if (user) {
         const isBluetoothEnabled = await checkBluetoothEnabled(user.id);
         if (!isBluetoothEnabled) {
+          Alert.alert(
+            "Bluetooth Permission Required",
+            "Please enable location permission to scan for Bluetooth devices.",
+            [{ text: "OK" }]
+          );
           return;
         }
       }
@@ -160,41 +164,59 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
       setIsScanning(true);
       setDiscoveredDevices([]);
 
+      let deviceFoundDuringFirstSecond = false;
+
       bleManager.startDeviceScan(null, null, (error, device) => {
         if (error) {
           console.error("BLE scan error:", error);
-          setIsScanning(false);
+          const errorMessage = error.message?.toLowerCase() || "";
+          
+          // Detect Bluetooth OFF error
+          if (
+            errorMessage.includes("bluetooth") ||
+            errorMessage.includes("off") ||
+            errorMessage.includes("enable") ||
+            errorMessage.includes("permission") ||
+            error.code === "BluetoothNotSupported" ||
+            error.code === "BluetoothNotEnabled"
+          ) {
+            setIsScanning(false);
+            bleManager.stopDeviceScan();
+            Alert.alert(
+              "Bluetooth is Off",
+              "Please turn on Bluetooth on your device to scan for wearables.",
+              [{ text: "OK" }]
+            );
+          }
           return;
         }
 
-        // Filter for health-related devices (smartwatches, fitness trackers, BP monitors)
-        if (device && device.name && (
-          device.name.toLowerCase().includes("watch") ||
-          device.name.toLowerCase().includes("band") ||
-          device.name.toLowerCase().includes("fitbit") ||
-          device.name.toLowerCase().includes("galaxy") ||
-          device.name.toLowerCase().includes("apple") ||
-          device.name.toLowerCase().includes("health") ||
-          device.name.toLowerCase().includes("omron") ||
-          device.name.toLowerCase().includes("bp") ||
-          device.name.toLowerCase().includes("monitor")
-        )) {
-          setDiscoveredDevices((prev) => {
-            const exists = prev.some((d) => d.id === device.id);
-            if (!exists) {
-              return [
-                ...prev,
-                {
-                  id: device.id,
-                  name: device.name || "Unknown Device",
-                  rssi: device.rssi || -100,
-                  connected: false,
-                },
-              ];
-            }
-            return prev;
-          });
+        if (!device) {
+          return;
         }
+
+        deviceFoundDuringFirstSecond = true;
+
+        if (!isRelevantDevice(device)) {
+          return;
+        }
+
+        const displayName = device.name || device.localName || "Unknown Device";
+        setDiscoveredDevices((prev) => {
+          const exists = prev.some((d) => d.id === device.id);
+          if (!exists) {
+            return [
+              ...prev,
+              {
+                id: device.id,
+                name: displayName,
+                rssi: device.rssi || -100,
+                connected: false,
+              },
+            ];
+          }
+          return prev;
+        });
       });
 
       // Stop scanning after 10 seconds
@@ -204,12 +226,12 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
         
         // Check if any devices were found and notify user
         setDiscoveredDevices((devices) => {
-          if (devices.length === 0 && user) {
-            createNotification(user.id, {
-              title: "No Devices Found",
-              body: "No Bluetooth health devices were found. Please ensure your device is powered on and within range.",
-              type: "device",
-            }).catch(() => {});
+          if (devices.length === 0) {
+            Alert.alert(
+              "No Devices Found",
+              "No Bluetooth health devices were found. Please ensure your device is powered on and within range.",
+              [{ text: "OK" }]
+            );
           }
           return devices;
         });
@@ -217,13 +239,11 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
     } catch (err) {
       console.error("Failed to start BLE scan:", err);
       setIsScanning(false);
-      if (user) {
-        await createNotification(user.id, {
-          title: "Scan Error",
-          body: "Failed to scan for Bluetooth devices. Please try again.",
-          type: "device",
-        }).catch(() => {});
-      }
+      Alert.alert(
+        "Scan Error",
+        "Failed to scan for Bluetooth devices. Please try again.",
+        [{ text: "OK" }]
+      );
     }
   }, [user]);
 
@@ -257,24 +277,23 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
         if (user) {
           try {
             await saveDevice(user.id, connected);
-            await createNotification(user.id, {
-              title: "Device Connected",
-              body: `Successfully connected to ${connected.name}`,
-              type: "device",
-            }).catch(() => {});
           } catch (err) {
             console.error("Failed to save device:", err);
           }
         }
+
+        Alert.alert(
+          "Device Connected",
+          `Successfully connected to ${connected.name}`,
+          [{ text: "OK" }]
+        );
       } catch (err) {
         console.error("Failed to connect to device:", err);
-        if (user) {
-          await createNotification(user.id, {
-            title: "Connection Failed",
-            body: "Failed to connect to the selected device. Please try again.",
-            type: "device",
-          }).catch(() => {});
-        }
+        Alert.alert(
+          "Connection Failed",
+          "Failed to connect to the selected device. Please try again.",
+          [{ text: "OK" }]
+        );
       }
     },
     [user]
@@ -297,7 +316,18 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
       }
     }
 
+    // Remove any existing disconnect subscription
+    if (disconnectSubscriptionRef.current) {
+      disconnectSubscriptionRef.current?.remove();
+      disconnectSubscriptionRef.current = null;
+    }
+
     setConnectedDevice(null);
+    Alert.alert(
+      "Device Disconnected",
+      connectedDevice ? `${connectedDevice.name} has been disconnected.` : "Your device has been disconnected.",
+      [{ text: "OK" }]
+    );
   }, [user, connectedDevice]);
 
   const processNewReading = useCallback(
@@ -316,7 +346,7 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
 
     // STEP 1: Secure the vital reading inside the database primary ledger
     try {
-      console.log("Saving manual entry payload to Supabase...", reading);
+      console.log("Saving vital reading to Supabase...", reading);
       savedReadingRow = await saveVitalReading(user.id, reading);
       console.log("✅ Core vital reading successfully committed to Supabase:", savedReadingRow);
     } catch (err) {
@@ -363,96 +393,446 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
   [user]
 );
 
+  const tryParseNUSReading = useCallback((buffer: Buffer): NUSParseResult | null => {
+    const ascii = buffer.toString("ascii").trim();
+    const hex = buffer.toString("hex");
+    const timestamp = new Date();
+
+    const validBp = (sys: number, dia: number, hr: number) => {
+      return (
+        sys >= 70 && sys <= 250 &&
+        dia >= 40 && dia <= 160 &&
+        hr >= 30 && hr <= 220 &&
+        dia < sys
+      );
+    };
+
+    const buildReading = (sys: number, dia: number, hr: number) => {
+      if (!validBp(sys, dia, hr)) {
+        return null;
+      }
+      return { systolic: sys, diastolic: dia, heartRate: hr, timestamp, source: "ble" };
+    };
+
+    if (ascii) {
+      const normalized = ascii.replace(/[^\d\/\s\-,]/g, " ").trim();
+      const pieces = normalized.match(/\d{2,3}/g);
+      if (pieces && pieces.length >= 2) {
+        const sys = Number(pieces[0]);
+        const dia = Number(pieces[1]);
+        const hr = pieces.length >= 3 ? Number(pieces[2]) : 70;
+        const parsed = buildReading(sys, dia, hr);
+        if (parsed) {
+          console.log("Parsed NUS ASCII payload:", ascii, "=>", parsed);
+          return { reading: parsed, method: "ascii" };
+        }
+      }
+    }
+
+    const candidates: Array<{ reading: VitalReading; score: number; reason: string }> = [];
+    const addCandidate = (sys: number, dia: number, hr: number, reason: string) => {
+      const parsed = buildReading(sys, dia, hr);
+      if (parsed) {
+        let score = Math.abs(sys - 120) + Math.abs(dia - 80) + Math.abs(hr - 70);
+        if (hr < 50) {
+          score += 30;
+        }
+        if (hr > 140) {
+          score += 20;
+        }
+        candidates.push({ reading: parsed, score, reason });
+      }
+    };
+
+    if (buffer.length >= 20 && buffer[0] === 0xdf && buffer[1] === 0x00 && buffer[2] === 0x11) {
+      const body = buffer.slice(3);
+      if (body.length >= 17) {
+        const extraFlags = body[12];
+        const systolic = body[6] * 2 + extraFlags;
+        const diastolic = body[1] * 16 + (extraFlags & 0x03);
+        const heartRate = body[5] * 8;
+
+        if (extraFlags !== 0) {
+          const parsed = buildReading(systolic, diastolic, heartRate);
+          if (parsed) {
+            console.log("Parsed NUS DF final-measurement packet:", hex, {
+              systolic,
+              diastolic,
+              heartRate,
+              extraFlags,
+              body0: body[0],
+            });
+            return { reading: parsed, method: "exact" };
+          }
+        }
+
+        const rawSystolic = body.readUInt16LE(1);
+        const rawDiastolic = body.readUInt16LE(3);
+        const rawHeartRate = body[5];
+
+        addCandidate(Math.round(rawSystolic / 2), rawDiastolic * 16, rawHeartRate * 8, "df-le-exact");
+        addCandidate(Math.round(rawSystolic / 2), rawDiastolic * 16, rawHeartRate * 4, "df-le-hr4");
+        addCandidate(Math.round(rawSystolic / 2), rawDiastolic * 16, rawHeartRate, "df-le-hr1");
+        addCandidate(Math.round(rawSystolic / 4), rawDiastolic * 8, rawHeartRate * 8, "df-le-alt-scale");
+
+        if (candidates.length > 0) {
+          candidates.sort((a, b) => a.score - b.score);
+          console.log("Parsed NUS DF packet candidate fallback:", hex, candidates[0]);
+          return { reading: candidates[0].reading, method: "fallback" };
+        }
+      }
+    }
+
+    if (buffer.length >= 3) {
+      for (let offset = 0; offset + 2 < buffer.length; offset += 1) {
+        const sys = buffer[offset];
+        const dia = buffer[offset + 1];
+        const hr = buffer[offset + 2];
+        const parsed = buildReading(sys, dia, hr);
+        if (parsed) {
+          console.log("Parsed NUS raw 3-byte payload:", hex, "=>", parsed);
+          return { reading: parsed, method: "fallback" };
+        }
+      }
+    }
+
+    const scaleFactors = [1, 0.5, 0.25, 2, 4, 16];
+    if (buffer.length >= 3) {
+      for (let offset = 0; offset + 2 < buffer.length; offset += 1) {
+        for (const scaleSys of scaleFactors) {
+          for (const scaleDia of scaleFactors) {
+            for (const scaleHr of scaleFactors) {
+              const sys = Math.round(buffer[offset] * scaleSys);
+              const dia = Math.round(buffer[offset + 1] * scaleDia);
+              const hr = Math.round(buffer[offset + 2] * scaleHr);
+              const parsed = buildReading(sys, dia, hr);
+              if (parsed) {
+                console.log("Parsed NUS scaled payload:", { offset, scaleSys, scaleDia, scaleHr, hex, parsed });
+                return { reading: parsed, method: "fallback" };
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if (buffer.length >= 6) {
+      for (let offset = 0; offset + 5 < buffer.length; offset += 1) {
+        const sys = buffer.readUInt16LE(offset);
+        const dia = buffer.readUInt16LE(offset + 2);
+        const hr = buffer[offset + 4];
+        const parsed = buildReading(sys, dia, hr);
+        if (parsed) {
+          console.log("Parsed NUS 16-bit LE payload:", hex, "=>", parsed);
+          return { reading: parsed, method: "fallback" };
+        }
+      }
+      for (let offset = 0; offset + 5 < buffer.length; offset += 1) {
+        const sys = buffer.readUInt16BE(offset);
+        const dia = buffer.readUInt16BE(offset + 2);
+        const hr = buffer[offset + 4];
+        const parsed = buildReading(sys, dia, hr);
+        if (parsed) {
+          console.log("Parsed NUS 16-bit BE payload:", hex, "=>", parsed);
+          return { reading: parsed, method: "fallback" };
+        }
+      }
+    }
+
+    return null;
+  }, []);
+
   const startMeasurement = useCallback(async () => {
     if (!connectedDevice) {
       console.warn("Attempted to start measurement with no connected device");
-      if (user) {
-        await createNotification(user.id, {
-          title: "No Device Connected",
-          body: "Please connect a BLE device before starting a measurement.",
-          type: "device",
-        }).catch(() => {});
-      }
+      Alert.alert(
+        "No Device Connected",
+        "Please connect a BLE device before starting a measurement.",
+        [{ text: "OK" }]
+      );
       return;
     }
 
     setIsMeasuring(true);
 
     try {
-      const device = bleManager.connectedDevices.find(
-        (d) => d.id === connectedDevice.id
-      );
+      const BP_SERVICE_UUID = "180b";
+      const BP_MEASUREMENT_UUID = "2a35";
+      const HEART_RATE_SERVICE_UUID = "180d";
+      const HEART_RATE_MEASUREMENT_UUID = "2a37";
 
-      if (!device) {
-        throw new Error("Device not found in connected devices");
+      const serviceFilter = [
+        NUS_SERVICE_UUID,
+        BP_SERVICE_UUID,
+        HEART_RATE_SERVICE_UUID,
+      ];
+
+      let device = null;
+      try {
+        const connectedDevices = await bleManager.connectedDevices(serviceFilter);
+        device = connectedDevices.find((d) => d.id === connectedDevice.id) || null;
+      } catch (error) {
+        console.warn("connectedDevices lookup failed, falling back to devices():", error);
       }
 
-      // Common Blood Pressure Service and Characteristic UUIDs
-      const BP_SERVICE_UUID = "180B"; // Blood Pressure Service
-      const BP_MEASUREMENT_UUID = "2A35"; // Blood Pressure Measurement
-      const HEART_RATE_SERVICE_UUID = "180D";
-      const HEART_RATE_MEASUREMENT_UUID = "2A37";
+      if (!device) {
+        const devices = await bleManager.devices([connectedDevice.id]);
+        device = devices[0] || null;
+      }
 
-      let systolic = 120;
-      let diastolic = 80;
-      let heartRate = 70;
+      if (!device) {
+        throw new Error("Device not found in BLE manager");
+      }
+
+      const isConnected = await bleManager.isDeviceConnected(device.id);
+      if (!isConnected) {
+        device = await bleManager.connectToDevice(device.id, { autoConnect: true });
+      }
+
+      await device.discoverAllServicesAndCharacteristics();
+
+      let systolic: number | null = null;
+      let diastolic: number | null = null;
+      let heartRate: number | null = null;
+      const hasCompleteMeasurement = () => systolic !== null && diastolic !== null && heartRate !== null;
 
       try {
-        // Try to read Blood Pressure measurement
         const services = await device.services();
         let bpCharacteristic = null;
         let hrCharacteristic = null;
+        let nusCharacteristicRx = null;
+        let nusCharacteristicTx = null;
 
         for (const service of services) {
           const characteristics = await service.characteristics();
 
           for (const characteristic of characteristics) {
-            if (
-              characteristic.uuid.toLowerCase() === BP_MEASUREMENT_UUID.toLowerCase()
-            ) {
+            const uuid = characteristic.uuid.toLowerCase();
+            if (uuid === BP_MEASUREMENT_UUID) {
               bpCharacteristic = characteristic;
             }
-            if (
-              characteristic.uuid.toLowerCase() === HEART_RATE_MEASUREMENT_UUID.toLowerCase()
-            ) {
+            if (uuid === HEART_RATE_MEASUREMENT_UUID) {
               hrCharacteristic = characteristic;
+            }
+            if (uuid === NUS_RX_UUID) {
+              nusCharacteristicRx = characteristic;
+            }
+            if (uuid === NUS_TX_UUID) {
+              nusCharacteristicTx = characteristic;
             }
           }
         }
 
-        // Read BP data if available
         if (bpCharacteristic) {
           const data = await bpCharacteristic.read();
-          // Standard GATT BP measurement format: flags, systolic, diastolic, etc.
           if (data.value) {
             const buffer = Buffer.from(data.value, "base64");
             if (buffer.length >= 7) {
-              systolic = buffer.readUInt16LE(1);
-              diastolic = buffer.readUInt16LE(3);
+              const sys = buffer.readUInt16LE(1);
+              const dia = buffer.readUInt16LE(3);
+              if (isValidBloodPressure(sys, dia)) {
+                systolic = sys;
+                diastolic = dia;
+              } else {
+                console.warn("Invalid BP measurement values read from characteristic:", {
+                  sys,
+                  dia,
+                  hex: buffer.toString("hex"),
+                });
+              }
             }
           }
         }
 
-        // Read HR data if available
         if (hrCharacteristic) {
           const data = await hrCharacteristic.read();
           if (data.value) {
             const buffer = Buffer.from(data.value, "base64");
             if (buffer.length >= 2) {
-              heartRate = buffer.readUInt8(1);
+              const hr = buffer.readUInt8(1);
+              if (isValidHeartRate(hr)) {
+                heartRate = hr;
+              } else {
+                console.warn("Invalid heart rate value read from characteristic:", {
+                  heartRate: hr,
+                  hex: buffer.toString("hex"),
+                });
+              }
             }
           }
         }
+
+        if (!hasCompleteMeasurement() && nusCharacteristicRx && nusCharacteristicTx) {
+          console.log("NUS discovery:", {
+            deviceId: device.id,
+            rx: nusCharacteristicRx.uuid,
+            tx: nusCharacteristicTx.uuid,
+          });
+
+          const notifications: Buffer[] = [];
+          let subscriptionError: Error | null = null;
+          let measurementMethod: "ascii" | "exact" | "fallback" | "unknown" = "unknown";
+          let measurementAttempt = 0;
+          const maxAttempts = 2;
+
+          while (measurementAttempt < maxAttempts && !hasCompleteMeasurement()) {
+            measurementAttempt++;
+            console.log(`NUS measurement attempt ${measurementAttempt}/${maxAttempts}`);
+            notifications.length = 0;
+
+            const subscription = device.monitorCharacteristicForService(
+              NUS_SERVICE_UUID,
+              NUS_TX_UUID,
+              (error, characteristic) => {
+                if (error) {
+                  const reason =
+                    (error as any)?.reason ||
+                    String((error as any)?.message || error);
+                  if (typeof reason === "string" && reason.includes("Operation was cancelled")) {
+                    return;
+                  }
+                  console.warn("NUS notification error:", error);
+                  subscriptionError = error as Error;
+                  return;
+                }
+
+                if (!characteristic?.value) {
+                  return;
+                }
+
+                const payload = Buffer.from(characteristic.value, "base64");
+                console.log(
+                  "NUS notification:",
+                  payload.toString("hex"),
+                  payload.toString("ascii")
+                );
+                notifications.push(payload);
+              }
+            );
+
+            console.log("NUS subscription established, sending commands...");
+
+            const candidateCommands = [
+              Buffer.from([0x01]),
+              Buffer.from([0x02]),
+              Buffer.from([0xa1]),
+              Buffer.from("start\r\n"),
+              Buffer.from("measure\r\n"),
+              Buffer.from("I\r\n"),
+            ];
+
+            const writeNusCommand = async (command: Buffer) => {
+              const base64 = command.toString("base64");
+              console.log("NUS write attempt:", command.toString("hex"), command.toString("ascii"));
+              try {
+                await device.writeCharacteristicWithResponseForService(
+                  NUS_SERVICE_UUID,
+                  NUS_RX_UUID,
+                  base64
+                );
+                return;
+              } catch (writeErr) {
+                console.warn("NUS write with response failed, trying without response:", writeErr);
+              }
+              try {
+                await device.writeCharacteristicWithoutResponseForService(
+                  NUS_SERVICE_UUID,
+                  NUS_RX_UUID,
+                  base64
+                );
+              } catch (writeErr) {
+                console.warn("NUS write without response failed:", writeErr);
+              }
+            };
+
+            for (const command of candidateCommands) {
+              await writeNusCommand(command);
+              await new Promise((resolve) => setTimeout(resolve, 700));
+            }
+
+            console.log("Commands sent, waiting 10 seconds for device response...");
+            await new Promise((resolve) => setTimeout(resolve, 10000));
+            subscription?.remove();
+
+            if (subscriptionError) {
+              console.error("NUS subscription encountered error:", subscriptionError);
+            }
+
+            if (notifications.length === 0) {
+              console.warn(
+                `Attempt ${measurementAttempt}: No NUS notifications received. Error: ${subscriptionError?.message || "none"}`
+              );
+              if (measurementAttempt < maxAttempts) {
+                console.log("Retrying after brief delay...");
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+              }
+            } else {
+              console.log(`Attempt ${measurementAttempt}: Received ${notifications.length} notification(s)`);
+            }
+
+            for (const payload of notifications) {
+              const parsed = tryParseNUSReading(payload);
+              if (parsed) {
+                measurementMethod = parsed.method;
+                systolic = parsed.reading.systolic;
+                diastolic = parsed.reading.diastolic;
+                heartRate = parsed.reading.heartRate;
+                console.log("Parsed measurement:", { systolic, diastolic, heartRate, method: measurementMethod });
+                break;
+              }
+            }
+
+            if (!hasCompleteMeasurement() && notifications.length > 1) {
+              const combined = Buffer.concat(notifications);
+              const parsed = tryParseNUSReading(combined);
+              if (parsed) {
+                measurementMethod = parsed.method;
+                systolic = parsed.reading.systolic;
+                diastolic = parsed.reading.diastolic;
+                heartRate = parsed.reading.heartRate;
+                console.log("Parsed combined measurement:", { systolic, diastolic, heartRate, method: measurementMethod });
+              }
+            }
+          }
+
+          if (!hasCompleteMeasurement() && notifications.length === 0) {
+            console.warn("Device not responding to NUS commands. Manual entry may be required.");
+          }
+
+          if (measurementMethod === "fallback") {
+            Alert.alert(
+              "Measurement May Be Inaccurate",
+              "This watch is using a nonstandard BLE payload format. The reading may not be fully accurate.",
+              [{ text: "OK" }]
+            );
+          }
+        }
       } catch (readErr) {
-        console.warn("Could not read BLE characteristics, using default values:", readErr);
-        // If we can't read specific characteristics, notify the user
+        console.warn("Could not read BLE characteristics:", readErr);
+        Alert.alert(
+          "Reading in Progress",
+          "Measurement is being taken from your device...",
+          [{ text: "OK" }]
+        );
+      }
+
+      if (systolic === null || diastolic === null || heartRate === null) {
+        console.error(
+          "No valid BLE measurement acquired. systolic:",
+          systolic,
+          "diastolic:",
+          diastolic,
+          "heartRate:",
+          heartRate
+        );
         if (user) {
           await createNotification(user.id, {
-            title: "Reading in Progress",
-            body: "Measurement is being taken from your device...",
+            title: "Measurement Failed",
+            body: "Could not get a valid measurement from the device. Please check if it's still connected and try again.",
             type: "device",
           }).catch(() => {});
         }
+        throw new Error("No valid BLE measurement found");
       }
 
       const reading: VitalReading = {
@@ -468,19 +848,70 @@ export const [BLEProvider, useBLE] = createContextHook((): BLEState => {
     } catch (err) {
       console.error("Failed to read measurement from device:", err);
       setIsMeasuring(false);
-      if (user) {
-        await createNotification(user.id, {
-          title: "Measurement Failed",
-          body: "Failed to read measurement from device. Please try again.",
-          type: "device",
-        }).catch(() => {});
-      }
+      Alert.alert(
+        "Measurement Failed",
+        "Failed to read measurement from device. Please try again.",
+        [{ text: "OK" }]
+      );
     }
-  }, [connectedDevice, processNewReading, user]);
+  }, [connectedDevice, processNewReading, tryParseNUSReading, user]);
 
   const stopMeasurement = useCallback(() => {
     setIsMeasuring(false);
   }, []);
+
+  // Setup disconnect listener when device is connected
+  useEffect(() => {
+    if (!connectedDevice || !user) {
+      return;
+    }
+
+    // Monitor the device connection state
+    const subscription = bleManager.onDeviceDisconnected(
+      connectedDevice.id,
+      async (error) => {
+        console.log("Device disconnected:", connectedDevice.name, error);
+
+        Alert.alert(
+          "Device Disconnected",
+          `Your ${connectedDevice.name} has been disconnected.`,
+          [{ text: "OK" }]
+        );
+
+        // Update database
+        try {
+          await disconnectDeviceDB(user.id, connectedDevice.id);
+        } catch (err) {
+          console.error("Failed to update device disconnect in database:", err);
+        }
+
+        setConnectedDevice(null);
+      }
+    );
+
+    disconnectSubscriptionRef.current = subscription;
+
+    // Cleanup: remove the subscription when component unmounts or device changes
+    return () => {
+      subscription?.remove();
+    };
+  }, [connectedDevice, user]);
+
+  const refreshHistory = useCallback(async () => {
+    if (!user) {
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const readings = await getVitalReadings(user.id);
+      setHistory(readings as VitalReading[]);
+    } catch (err) {
+      console.error("Failed to refresh BLE history:", err);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [user]);
 
   const addManualReading = useCallback(
     async (systolic: number, diastolic: number, heartRate: number) => {

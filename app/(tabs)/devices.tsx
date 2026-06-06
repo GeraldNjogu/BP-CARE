@@ -126,7 +126,8 @@ export default function DevicesScreen() {
             </LinearGradient>
           </TouchableOpacity>
           <Text style={{ color: colors.textMuted, fontSize: 12, lineHeight: 18, marginBottom: 24 }}>
-            If Bluetooth is turned off, real devices will not appear. This scan is currently simulated in this app build.
+            If Bluetooth is turned off, real devices will not appear.
+            Scanning now includes Bluetooth devices that advertise watch and health services.
           </Text>
         </>
       )}

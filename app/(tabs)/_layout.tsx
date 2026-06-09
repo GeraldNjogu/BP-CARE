@@ -7,6 +7,8 @@ import {
   TrendingUp,
   Bell,
   UserCircle,
+  Watch,
+  Settings,
 } from "lucide-react-native";
 import { View, Text, ActivityIndicator } from "react-native";
 import { useNotifications } from "@/context/NotificationContext";
@@ -104,11 +106,29 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
+        name="devices"
+        options={{
+          title: "Devices",
+          tabBarIcon: ({ color, size }) => (
+            <Watch size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
         name="profile"
         options={{
           title: "Profile",
           tabBarIcon: ({ color, size }) => (
             <UserCircle size={size} color={color} />
+          ),
+        }}
+      />
+      <Tabs.Screen
+        name="settings"
+        options={{
+          title: "Settings",
+          tabBarIcon: ({ color, size }) => (
+            <Settings size={size} color={color} />
           ),
         }}
       />

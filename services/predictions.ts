@@ -7,7 +7,7 @@ export type MLPrediction = {
   crisisPrediction: string;
   crisisProbability: number;
   modelVersion: string;
-  createdAt: Date;
+  createdAt: Date; 
 };
 
 export type XAIInsight = {

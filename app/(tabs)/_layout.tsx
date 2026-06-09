@@ -12,11 +12,13 @@ import {
 } from "lucide-react-native";
 import { View, Text, ActivityIndicator } from "react-native";
 import { useNotifications } from "@/context/NotificationContext";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 export default function TabLayout() {
   const { colors } = useTheme();
   const { isAuthenticated, isLoading } = useAuth();
   const { unreadCount } = useNotifications();
+  const insets = useSafeAreaInsets();
 
   if (isLoading) {
     return (
@@ -39,8 +41,8 @@ export default function TabLayout() {
           backgroundColor: colors.card,
           borderTopColor: colors.border,
           borderTopWidth: 1,
-          height: 80,
-          paddingBottom: 24,
+          height: 56 + insets.bottom,
+          paddingBottom: insets.bottom + 12,
           paddingTop: 8,
         },
         tabBarLabelStyle: {

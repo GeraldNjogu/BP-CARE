@@ -3,6 +3,7 @@ import { Stack } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import React, { useEffect } from "react";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
+import { SafeAreaProvider } from "react-native-safe-area-context";
 import { ThemeProvider } from "@/context/ThemeContext";
 import { AuthProvider } from "@/context/AuthContext";
 import { BLEProvider } from "@/context/BLEContext";
@@ -35,7 +36,9 @@ export default function RootLayout() {
             <NotificationProvider>
               <ChatProvider>
                 <GestureHandlerRootView style={{ flex: 1 }}>
-                  <RootLayoutNav />
+                  <SafeAreaProvider>
+                    <RootLayoutNav />
+                  </SafeAreaProvider>
                 </GestureHandlerRootView>
               </ChatProvider>
             </NotificationProvider>

@@ -413,10 +413,12 @@ export default function FloatingChatbot() {
                   onSubmitEditing={handleSend}
                   style={{
                     flex: 1,
+                    minWidth: 0,
                     height: 44,
                     backgroundColor: colors.inputBackground,
                     borderRadius: 22,
                     paddingHorizontal: 16,
+                    paddingRight: 24,
                     fontSize: 14,
                     color: colors.text,
                     borderWidth: 1,

@@ -13,7 +13,7 @@ import {
   createPrediction,
   createXAIInsight,
 } from "@/services/predictions";
-import { BleManager } from "react-native-ble-plx";
+import { BleManager, State as BleState } from "react-native-ble-plx";
 import { PermissionsAndroid, Platform, Alert } from "react-native";
 import { HryfineSession, isHryfineDevice } from "@/services/hryfine/HryfineSession";
 import { GATT } from "@/services/hryfine/constants";
@@ -69,8 +69,42 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
 
   const disconnectSubscriptionRef = useRef<ReturnType<BleManager["onDeviceDisconnected"]> | null>(null);
   const hryfineSessionRef = useRef<HryfineSession | null>(null);
-  const checkBluetoothEnabled = async () => {
+  const checkBluetoothEnabled = useCallback(async () => {
     try {
+      const state = await bleManager.state();
+      if (state === BleState.PoweredOff) {
+        Alert.alert(
+          "Bluetooth is turned off",
+          "Please turn on Bluetooth to scan for devices and connect your watch.",
+          [{ text: "OK" }]
+        );
+        return false;
+      }
+      if (state === BleState.Unsupported) {
+        Alert.alert(
+          "Bluetooth Unsupported",
+          "This device does not support Bluetooth Low Energy, so scanning is unavailable.",
+          [{ text: "OK" }]
+        );
+        return false;
+      }
+      if (state === BleState.Unauthorized) {
+        Alert.alert(
+          "Bluetooth Permission Required",
+          "Please enable Bluetooth permissions in your device settings to scan for devices.",
+          [{ text: "OK" }]
+        );
+        return false;
+      }
+      if (state !== BleState.PoweredOn) {
+        Alert.alert(
+          "Bluetooth unavailable",
+          "Bluetooth is not ready yet. Please wait a moment and try again.",
+          [{ text: "OK" }]
+        );
+        return false;
+      }
+
       if (Platform.OS === "android") {
         const permissions = [PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION];
         if (Platform.Version >= 31) {
@@ -80,16 +114,29 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
           );
         }
         const results = await PermissionsAndroid.requestMultiple(permissions);
-        return Object.values(results).every(
+        const granted = Object.values(results).every(
           (result) => result === PermissionsAndroid.RESULTS.GRANTED
         );
+        if (!granted) {
+          Alert.alert(
+            "Bluetooth Permission Required",
+            "Please enable location and Bluetooth permissions to scan for devices.",
+            [{ text: "OK" }]
+          );
+        }
+        return granted;
       }
       return true;
     } catch (err) {
       console.error("Permission request error:", err);
-      return true;
+      Alert.alert(
+        "Bluetooth unavailable",
+        "Unable to check Bluetooth status. Please make sure Bluetooth is enabled and try again.",
+        [{ text: "OK" }]
+      );
+      return false;
     }
-  };
+  }, []);
 
   const processNewReading = useCallback(
     async (reading: VitalReading) => {
@@ -177,11 +224,6 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
     try {
       const granted = await checkBluetoothEnabled();
       if (!granted) {
-        Alert.alert(
-          "Bluetooth Permission Required",
-          "Please enable location and Bluetooth permissions to scan for devices.",
-          [{ text: "OK" }]
-        );
         return;
       }
 
@@ -337,11 +379,17 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
 
     try {
       const session = hryfineSessionRef.current;
-      await session.startBloodPressureMeasurement();
-
-      const result = await session.waitForBloodPressureResult(90000);
+      console.debug("startMeasurement: invoking measureBloodPressure", { deviceId: connectedDevice.id });
+      const result = await session.measureBloodPressure(60000);
+      console.debug("startMeasurement: measureBloodPressure returned", { result });
       if (!result) {
-        throw new Error("Timed out waiting for blood pressure result");
+        console.warn("startMeasurement: no BP result received within timeout");
+        Alert.alert(
+          "Measurement Pending",
+          "Your watch started measurement, but no reading arrived yet. Keep it on and try again if needed.",
+          [{ text: "OK" }]
+        );
+        return;
       }
 
       await processNewReading({
@@ -380,11 +428,15 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
 
     try {
       const session = hryfineSessionRef.current;
-      await session.startHeartRateMeasurement();
-
-      const result = await session.waitForHeartRateResult(60000);
+      const result = await session.measureHeartRate(60000);
       if (!result) {
-        throw new Error("Timed out waiting for heart rate result");
+        console.warn("startHeartRateMeasurement: no HR result received within timeout");
+        Alert.alert(
+          "Measurement Pending",
+          "Your watch started heart rate measurement, but no reading arrived yet. Keep it on and try again if needed.",
+          [{ text: "OK" }]
+        );
+        return;
       }
 
       setLastReading((prev) => ({

@@ -36,7 +36,16 @@ export const [NotificationProvider, useNotifications] = createContextHook((): No
     try {
       setIsLoading(true);
       const notifications = await getNotifications(user.id);
-      setItems(notifications);
+      // Filter out noisy/inaccurate measurement notifications
+      const filtered = (notifications || []).filter((n) => {
+        const body = (n.body || "").toLowerCase();
+        // remove any notification that explicitly mentions inaccurate measurements
+        if (body.includes("inaccurate") || body.includes("may be inaccurate") || body.includes("measurement may be")) {
+          return false;
+        }
+        return true;
+      });
+      setItems(filtered);
     } catch (err) {
       console.error("Failed to load notifications:", err);
     } finally {
@@ -75,8 +84,14 @@ export const [NotificationProvider, useNotifications] = createContextHook((): No
           timestamp: new Date(payload.new.timestamp),
         };
 
-        // Prepend the new notification to the top of the state array
-        setItems((prev) => [newNotif, ...prev]);
+          // Ignore noisy/inaccurate measurement notifications
+          const newBody = (newNotif.body || "").toLowerCase();
+          if (newBody.includes("inaccurate") || newBody.includes("may be inaccurate") || newBody.includes("measurement may be")) {
+            return;
+          }
+
+          // Prepend the new notification to the top of the state array
+          setItems((prev) => [newNotif, ...prev]);
       }
     )
     .subscribe();

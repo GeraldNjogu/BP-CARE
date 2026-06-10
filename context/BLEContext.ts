@@ -17,6 +17,7 @@ import { BleManager, State as BleState } from "react-native-ble-plx";
 import { PermissionsAndroid, Platform, Alert } from "react-native";
 import { HryfineSession, isHryfineDevice } from "@/services/hryfine/HryfineSession";
 import { GATT } from "@/services/hryfine/constants";
+import { filterBPReading } from "@/services/bpFilter";
 
 export type BLEDevice = {
   id: string;
@@ -140,6 +141,20 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
 
   const processNewReading = useCallback(
     async (reading: VitalReading) => {
+      // Validate BP reading using filter
+      const previousReading = history.length > 0 ? history[0] : null;
+      const filterResult = filterBPReading(reading, undefined, previousReading);
+
+      if (!filterResult.isValid) {
+        console.warn("BP reading filtered out:", filterResult.reason);
+        Alert.alert(
+          "Invalid Reading",
+          `Reading rejected: ${filterResult.reason}. Please try measuring again.`,
+          [{ text: "OK" }]
+        );
+        return;
+      }
+
       setLastReading(reading);
       setHistory((prev) => [reading, ...prev]);
 
@@ -491,12 +506,25 @@ export const [BLEProvider, useBLE] = createContextHook(() => {
     try {
       const readings = await getVitalReadings(user.id);
       setHistory(readings as VitalReading[]);
+      if (readings.length > 0) {
+        setLastReading(readings[0] as VitalReading);
+      }
     } catch (err) {
       console.error("Failed to refresh history:", err);
     } finally {
       setIsLoading(false);
     }
   }, [user]);
+
+  useEffect(() => {
+    if (!user) {
+      setHistory([]);
+      setLastReading(null);
+      return;
+    }
+
+    refreshHistory();
+  }, [user, refreshHistory]);
 
   const addManualReading = useCallback(
     async (systolic: number, diastolic: number, heartRate: number) => {

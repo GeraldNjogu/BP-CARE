@@ -54,6 +54,13 @@ function getBPCategory(sys: number, dia: number) {
   return { label: "Normal", color: "#10B981", level: 0 };
 }
 
+function getTimeBasedGreeting() {
+  const hour = new Date().getHours();
+  if (hour < 12) return "Good Morning,";
+  if (hour < 17) return "Good Afternoon,";
+  return "Good Evening,";
+}
+
 export default function DashboardScreen() {
   const router = useRouter();
   const { colors } = useTheme();
@@ -189,7 +196,7 @@ export default function DashboardScreen() {
                   fontWeight: "500",
                 }}
               >
-                Good Morning,
+                {getTimeBasedGreeting()}
               </Text>
               <Text
                 style={{

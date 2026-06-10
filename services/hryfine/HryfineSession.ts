@@ -6,8 +6,10 @@ import {
   isBpMeasurementStarted,
   isBpResultFrame,
   isHrResultFrame,
+  parseNotificationChunk,
   tryParseVitalFromDfFrame,
   type ParsedDfFrame,
+  type ParsedFdFrame,
   type VitalMeasurement,
 } from "./packetParser";
 import {
@@ -26,13 +28,19 @@ export type HryfineSessionOptions = {
 };
 
 const toBase64 = (buf: Buffer) => buf.toString("base64");
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** FD opcodes from the watch that Hryfine answers with SESSION_SYNC_ACK. */
+const FD_ACK_OPCODES = new Set([0x04, 0x12, 0x14, 0x17, 0x18, 0x19, 0x1c, 0x1d]);
 
 export class HryfineSession {
   private device: Device;
   private reassembler = new DfFrameReassembler();
-  private subscription: Subscription | null = null;
+  private subscriptions: Subscription[] = [];
   private options: HryfineSessionOptions;
   private lastHeartRate = 0;
+  private lastFdAckAt = 0;
+  private measureStartedResolve: (() => void) | null = null;
 
   constructor(device: Device, options: HryfineSessionOptions = {}) {
     this.device = device;
@@ -45,79 +53,115 @@ export class HryfineSession {
 
   async setup(): Promise<void> {
     await this.device.discoverAllServicesAndCharacteristics();
+    this.log("Hryfine services discovered");
+
     await this.enableNotifications(GATT.NUS_TX);
     await this.enableNotifications(GATT.FF01_NOTIFY);
     await this.enableNotifications(GATT.FF14_NOTIFY);
-    this.subscription = this.device.monitorCharacteristicForService(
-      GATT.NUS_SERVICE,
-      GATT.NUS_TX,
-      (error, characteristic) => {
-        if (error) {
-          const msg = String((error as Error).message || error);
-          if (!msg.includes("Operation was cancelled")) {
-            this.log("NUS notification error", { error: msg });
-          }
-          return;
-        }
-        if (!characteristic?.value) {
-          return;
-        }
-        this.handleChunk(Buffer.from(characteristic.value, "base64"));
-      }
-    );
-    this.log("Hryfine session ready");
+
+    await Promise.all([
+      this.monitorCharacteristic(GATT.NUS_SERVICE, GATT.NUS_TX),
+      this.monitorCharacteristic(GATT.FF00_SERVICE, GATT.FF01_NOTIFY),
+      this.monitorCharacteristic(GATT.FF12_SERVICE, GATT.FF14_NOTIFY),
+    ]);
+
+    this.log("Hryfine session ready", {
+      monitored: [GATT.NUS_TX, GATT.FF01_NOTIFY, GATT.FF14_NOTIFY],
+    });
   }
 
   private async enableNotifications(characteristicUuid: string) {
-    try {
-      await this.device.writeDescriptorForService(
-        GATT.NUS_SERVICE,
-        GATT.NUS_TX,
-        GATT.CCCD,
-        toBase64(Buffer.from([0x01, 0x00]))
-      );
-    } catch {
-      // Some characteristics live on other services — enable per-service below.
-    }
-
+    this.log("enableNotifications", { characteristicUuid });
     const services = await this.device.services();
     for (const service of services) {
       const characteristics = await service.characteristics();
-      const match = characteristics.find(
-        (c) => c.uuid.toLowerCase() === characteristicUuid.toLowerCase()
+      for (const characteristic of characteristics) {
+        if (characteristic.uuid.toLowerCase() !== characteristicUuid.toLowerCase()) {
+          continue;
+        }
+        if (!characteristic.isNotifiable) {
+          continue;
+        }
+        try {
+          await this.device.writeDescriptorForService(
+            service.uuid,
+            characteristicUuid,
+            GATT.CCCD,
+            toBase64(Buffer.from([0x01, 0x00]))
+          );
+          this.log("enabledNotification", {
+            service: service.uuid,
+            characteristic: characteristicUuid,
+          });
+        } catch (err) {
+          this.log("CCCD write skipped", { characteristicUuid, err: String(err) });
+        }
+      }
+    }
+  }
+
+  private async monitorCharacteristic(serviceUuid: string, characteristicUuid: string) {
+    try {
+      const subscription = this.device.monitorCharacteristicForService(
+        serviceUuid,
+        characteristicUuid,
+        (error, characteristic) => {
+          if (error) {
+            const msg = String((error as Error).message || error);
+            if (!msg.includes("Operation was cancelled")) {
+              this.log("notification error", {
+                serviceUuid,
+                characteristicUuid,
+                error: msg,
+              });
+            }
+            return;
+          }
+          if (!characteristic?.value) {
+            return;
+          }
+          this.handleChunk(Buffer.from(characteristic.value, "base64"));
+        }
       );
-      if (!match || !match.isNotifiable) {
-        continue;
-      }
-      try {
-        await this.device.writeDescriptorForService(
-          service.uuid,
-          characteristicUuid,
-          GATT.CCCD,
-          toBase64(Buffer.from([0x01, 0x00]))
-        );
-      } catch (err) {
-        this.log("CCCD write skipped", { characteristicUuid, err: String(err) });
-      }
+      this.subscriptions.push(subscription);
+      this.log("monitoringCharacteristic", { serviceUuid, characteristicUuid });
+    } catch (err) {
+      this.log("monitorCharacteristic_failed", {
+        serviceUuid,
+        characteristicUuid,
+        err: String(err),
+      });
     }
   }
 
   private async writeRx(payload: Buffer) {
     const base64 = toBase64(payload);
-    this.log("NUS write", { hex: payload.toString("hex") });
+    const hex = payload.toString("hex");
+    this.log("NUS write_attempt", { hex });
+
+    // Prefer write with response (safer) and fall back to without-response if needed.
     try {
       await this.device.writeCharacteristicWithResponseForService(
         GATT.NUS_SERVICE,
         GATT.NUS_RX,
         base64
       );
+      this.log("NUS write_done", { hex, method: "withResponse" });
       return;
-    } catch {
-      await this.device.writeCharacteristicWithoutResponseForService(
-        GATT.NUS_SERVICE,
-        GATT.NUS_RX,
-        base64
-      );
+    } catch (errWith) {
+      this.log("NUS write_withResponse_failed", { hex, err: String(errWith) });
+      try {
+        await this.device.writeCharacteristicWithoutResponseForService(
+          GATT.NUS_SERVICE,
+          GATT.NUS_RX,
+          base64
+        );
+        this.log("NUS write_done", { hex, method: "withoutResponse" });
+        return;
+      } catch (errWithout) {
+        this.log("NUS write_failed", { hex, err: String(errWithout) });
+        throw errWithout;
+      }
     }
   }
 
@@ -132,6 +176,12 @@ export class HryfineSession {
       length: chunk.length,
     });
 
+    const immediate = parseNotificationChunk(chunk);
+    if (immediate?.kind === "fd") {
+      this.handleFdFrame(immediate);
+      return;
+    }
+
     const frame = this.reassembler.push(chunk);
     if (!frame) {
       return;
@@ -145,6 +195,31 @@ export class HryfineSession {
     this.handleDfFrame(frame);
   }
 
+  private handleFdFrame(frame: ParsedFdFrame) {
+    this.log("FD frame", {
+      opcode: `0x${frame.opcode.toString(16)}`,
+      hex: frame.raw.toString("hex"),
+    });
+
+    if (FD_ACK_OPCODES.has(frame.opcode)) {
+      this.sendSessionSyncAck().catch(() => {});
+    }
+  }
+
+  private async sendSessionSyncAck() {
+    const now = Date.now();
+    if (now - this.lastFdAckAt < 20) {
+      return;
+    }
+    this.lastFdAckAt = now;
+    this.log("sendSessionSyncAck", { hex: SESSION_SYNC_ACK.toString("hex") });
+    try {
+      await this.writeRx(SESSION_SYNC_ACK);
+    } catch (err) {
+      this.log("sendSessionSyncAck_failed", { err: String(err) });
+    }
+  }
+
   private handleDfFrame(frame: ParsedDfFrame) {
     if (frame.subCommand === 0x08 && frame.payload[0] === 0x01) {
       this.sendBindHandshake().catch(() => {});
@@ -152,12 +227,25 @@ export class HryfineSession {
 
     if (isBpMeasurementStarted(frame)) {
       this.options.onBpStarted?.();
+      this.measureStartedResolve?.();
+      this.measureStartedResolve = null;
+      this.sendSessionSyncAck().catch(() => {});
     }
 
     const vital = tryParseVitalFromDfFrame(frame);
     if (!vital) {
+      this.log("vital_parse_skipped", {
+        subCommand: `0x${frame.subCommand.toString(16)}`,
+        raw: frame.raw.toString("hex"),
+      });
       return;
     }
+
+    this.log("vital_parsed", {
+      subCommand: `0x${frame.subCommand.toString(16)}`,
+      vital,
+      raw: frame.raw.toString("hex"),
+    });
 
     if (vital.heartRate > 0 && vital.systolic === 0) {
       this.lastHeartRate = vital.heartRate;
@@ -182,21 +270,80 @@ export class HryfineSession {
     }
   }
 
+  /** Prime the link, send start command, confirm watch entered measure mode. */
+  private async activateMeasurementOnWatch(startCommand: Buffer): Promise<void> {
+    this.log("activateMeasurementOnWatch_start", { startHex: startCommand.toString("hex") });
+    await this.sendSessionSyncAck();
+    await sleep(50);
+    await this.sendSessionSyncAck();
+
+    const started = this.waitForMeasureStarted(6000);
+    try {
+      await this.writeRx(startCommand);
+    } catch (err) {
+      this.log("write_start_command_failed", { err: String(err), startHex: startCommand.toString("hex") });
+    }
+    const watchAcked = await started;
+
+    if (!watchAcked) {
+      this.log("Measure start not acked, retrying start command");
+      await this.sendSessionSyncAck();
+      await sleep(80);
+      const retry = this.waitForMeasureStarted(5000);
+      try {
+        await this.writeRx(startCommand);
+      } catch (err) {
+        this.log("write_start_command_retry_failed", { err: String(err), startHex: startCommand.toString("hex") });
+      }
+      await retry;
+    }
+
+    await this.sendSessionSyncAck();
+  }
+
+  private waitForMeasureStarted(timeoutMs: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.measureStartedResolve = null;
+        resolve(false);
+      }, timeoutMs);
+
+      this.measureStartedResolve = () => {
+        clearTimeout(timer);
+        resolve(true);
+      };
+    });
+  }
+
   async startBloodPressureMeasurement(): Promise<void> {
-    await this.writeRx(SESSION_SYNC_ACK);
-    await this.writeRx(START_BP_MEASUREMENT);
+    await this.activateMeasurementOnWatch(START_BP_MEASUREMENT);
   }
 
   async startHeartRateMeasurement(): Promise<void> {
-    await this.writeRx(SESSION_SYNC_ACK);
-    await this.writeRx(START_HR_MEASUREMENT);
+    await this.activateMeasurementOnWatch(START_HR_MEASUREMENT);
+  }
+
+  /** Register result listener, then activate the watch (order matters). */
+  async measureBloodPressure(timeoutMs = 60000): Promise<VitalMeasurement | null> {
+    const resultPromise = this.waitForBloodPressureResult(timeoutMs);
+    await sleep(20);
+    await this.activateMeasurementOnWatch(START_BP_MEASUREMENT);
+    return resultPromise;
+  }
+
+  async measureHeartRate(timeoutMs = 60000): Promise<VitalMeasurement | null> {
+    const resultPromise = this.waitForHeartRateResult(timeoutMs);
+    await sleep(20);
+    await this.activateMeasurementOnWatch(START_HR_MEASUREMENT);
+    return resultPromise;
   }
 
   /**
    * Wait for a BP result frame up to timeoutMs.
    * Returns null if the watch does not deliver a reading in time.
    */
-  waitForBloodPressureResult(timeoutMs = 90000): Promise<VitalMeasurement | null> {
+  waitForBloodPressureResult(timeoutMs = 60000): Promise<VitalMeasurement | null> {
+    this.log("waitForBloodPressureResult_start", { timeoutMs });
     return this.waitForVital(
       (reading) => reading.systolic > 0 && reading.diastolic > 0,
       timeoutMs
@@ -216,12 +363,14 @@ export class HryfineSession {
   ): Promise<VitalMeasurement | null> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => {
+        this.log("waitForVital_timeout", { timeoutMs });
         cleanup();
         resolve(null);
       }, timeoutMs);
 
       const prevOnVital = this.options.onVital;
       const handler = (reading: VitalMeasurement) => {
+        this.log("waitForVital_received", { reading });
         prevOnVital?.(reading);
         if (isMatch(reading)) {
           cleanup();
@@ -239,8 +388,8 @@ export class HryfineSession {
   }
 
   dispose() {
-    this.subscription?.remove();
-    this.subscription = null;
+    this.subscriptions.forEach((sub) => sub.remove());
+    this.subscriptions = [];
     this.reassembler.reset();
   }
 }

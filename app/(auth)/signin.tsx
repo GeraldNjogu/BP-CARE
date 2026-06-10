@@ -99,6 +99,9 @@ export default function SignInScreen() {
               fontSize: 14,
               color: "rgba(255,255,255,0.85)",
               marginTop: 6,
+              width: "85%",
+              textAlign: "center",
+              lineHeight: 18,
             }}
           >
             Intelligent Blood Pressure Management
